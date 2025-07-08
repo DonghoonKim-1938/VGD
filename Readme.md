@@ -6,12 +6,15 @@
 
 * VGD generates fully interpretable prompts that enhance generalizability across tasks and models in text-to-image generation.
 
-![Figure 1](./figure1.png)
+<p align="center">
+  <img src="./figure1.png" alt="Figure 1" width="600"/>
+</p>
 
 * While conventional prompt inversion techniques update prompt embeddings through gradient-based optimization and quantization, VGD is a gradient-free technique that utilizes large language models and CLIP to generate relevant sentences.
 
-![Figure 2](./figure2.png)
-
+<p align="center">
+  <img src="./figure2.png" alt="Figure 2" width="600"/>
+</p>
 
 ---
 
