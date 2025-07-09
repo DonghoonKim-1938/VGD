@@ -1,0 +1,46 @@
+project: "VGD"
+name: "VGD-${dataset_name}"
+dataset_name: "lexica.art"
+save_dir: "/vgd_prompt_inversion/${dataset_name}/"
+save_file: "results_${dataset_name}.csv"
+data_dir: ["/vgd_prompt_inversion/lexica.art/images/1.png"]
+gps: 1  # this configuration file is set for 8-GPUs
+batch_size: 1
+style_transfer: False
+object: None
+
+# ---------------------------------------------------------------- #
+wandb:
+  mode: "disabled"
+  notes: null
+  id: null
+
+seed: 0
+
+# ---------------------------------------------------------------- #
+model:
+  type: "LLaVA"
+  model_ckpt: "/sdb1/models/llava"
+  load_in_8bit: true
+  max_length: 32
+  min_length: 32
+  freeze_model: false
+  gen_prompt_only: false
+  num_beams: 10 # CLIP Beam
+  beam_expand_factor: 10 # LLM Beam = CLIP Beam x beam_expand_factor
+  llm_alpha: 1.0 # Beam LLM Score Hyper Parameter
+  clip_alpha: 1.5 # Beam CLIP Score Hyper Parameter
+  clip_version: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K" # "openai/clip-vit-large-patch14", "timm/resnet50_clip.openai", "openai/clip-vit-base-patch32"
+  sd_version: "stabilityai/stable-diffusion-2-1"
+  clip_ref: "ViT-g-14"
+  clip_ref_pretrain: "laion2b_s12b_b42k"
+  sampling: # Stable Diffusion
+    steps: 25
+    n_samples: 4 # how many samples to produce for each given prompt. aka batch size
+    n_rows: 0 # rows in the grid
+    scale: 9.0 #
+  prompt: "USER: <image>\nPlease generate the diffusion prompt containing the objects, people, background and the style of the image. ASSISTANT: Sure, here is a prompt for stable diffusion within ${model.max_length} tokens:\n"
+  get_initial_condition: true
+  use_caption_as_initial_condition: None
+  get_similarity: false
+# ---------------------------------------------------------------- #

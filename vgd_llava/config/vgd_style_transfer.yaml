@@ -1,0 +1,62 @@
+project: "VGPG"
+type: "StableDiffusion"
+name: "VGPG-${new_class}"
+new_object: "Axolotl"
+dataset_name: "imagenet"
+save_dir: "/data/mjbae/txt2img_output/${project}/${dataset_name}/"
+save_file: "results_${dataset_name}.csv"
+data_dir: "/data/dataset/vgpg/${dataset_name}/${new_class}"
+gps: 1  # this configuration file is set for 8-GPUs
+batch_size: 1
+style_transfer: true
+object: "A Paris"
+
+# ---------------------------------------------------------------- #
+wandb:
+  mode: "disabled"
+  notes: null
+  id: null
+
+seed: 12345
+
+# ---------------------------------------------------------------- #
+model:
+  model_ckpt: "/data/models/llava"
+  load_in_8bit: true
+  max_length: 64
+  min_length: 50
+  freeze_model: false
+  gen_prompt_only: false
+  num_beams: 10
+  beam_expand_factor: 10
+  clip_version: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K" # "openai/clip-vit-large-patch14"
+  sd_version: "stabilityai/stable-diffusion-2-1"
+  clip_ref: "ViT-g-14"
+  clip_ref_pretrain: "laion2b_s12b_b42k"
+  sampling: # Stable Diffusion
+    steps: 50
+    n_samples: 15 # how many samples to produce for each given prompt. aka batch size
+    n_rows: 0 # rows in the grid
+    scale: 9.0 #
+  prompt: "USER: <image>\nPlease generate the diffusion prompt of the image style based on the given condition containing the painting style, color, and shapes of the image ASSISTANT: Sure, here is a prompt for stable diffusion within ${model.max_length} tokens:\n"
+  get_initial_condition: true
+# ---------------------------------------------------------------- #
+dataset:
+  size: 224
+  center_crop: true
+  object_name: "${new_object}"
+  super_class: "${super_class}"
+  dataset_name: "${dataset_name}"
+  class_id: "${new_class}"
+# ---------------------------------------------------------------- #
+dataloader:
+  valid:
+    batch_size: ${batch_size}  # per-GPU
+    num_workers: 4  # per-process
+
+# ---------------------------------------------------------------- #
+trainer:
+  fp16: true
+  print_interval_iters: 100
+  valid_interval_epochs: 1
+  batch_size: ${batch_size}

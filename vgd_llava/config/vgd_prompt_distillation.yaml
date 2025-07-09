@@ -1,0 +1,69 @@
+project: "VGPG"
+type: "StableDiffusion"
+super_class: "amphibian"
+new_object: "Axolotl"
+new_class: "n01632777"
+name: "VGPG-${new_class}"
+dataset_name: "lexica.art"
+save_dir: "/data/mjbae/txt2img_output/VGPG_prompt_distillation/${dataset_name}/"
+save_file: "results_prompt_distillation_${dataset_name}.csv"
+data_dir: ["/data/dataset/lexica.art/images/${new_class}"]
+gps: 1  # this configuration file is set for 8-GPUs
+batch_size: 1
+style_transfer: False
+object: None
+prompt_distillation: True
+target_prompt: 'Cloudscape by Adam Paquette, nebula gasses in the background by Gene Raz Von Edler, fantasy magic angel concept art from deviantart by Donato Giancola, Rendered in Octane, cinematic, Highly Detailed'
+distillation_ratio: 0.3
+
+# ---------------------------------------------------------------- #
+wandb:
+  mode: "disabled"
+  notes: null
+  id: null
+
+seed: 12345
+
+# ---------------------------------------------------------------- #
+model:
+  model_ckpt: "/data/models/llama/converted-ckpt"
+  load_in_8bit: true
+  max_length: 75
+  min_length: 60
+  freeze_model: false
+  gen_prompt_only: false
+  num_beams: 10
+  beam_expand_factor: 10
+  clip_version: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K" # "openai/clip-vit-large-patch14"
+  sd_version: "stabilityai/stable-diffusion-2-1"
+  clip_ref: "ViT-g-14"
+  clip_ref_pretrain: "laion2b_s12b_b42k"
+  sampling: # Stable Diffusion
+    steps: 25
+    n_samples: 4 # how many samples to produce for each given prompt. aka batch size
+    n_rows: 0 # rows in the grid
+    scale: 9.0 #
+  user_prompt: "Please generate the diffusion prompt within {max_length} tokens so that you can generate same images with a given prompt: ${target_prompt}"
+  system_prompt: "You are a respectful and honest visual description generator for Stable Diffusion text prompt. Answer in 1 sentence and do not mention anything other than prompt. Do not mention 'description'."
+  model_prompt: " Answer: Sure, here is a prompt for stable diffusion within {max_length} tokens:\n "
+  get_initial_condition: false
+# ---------------------------------------------------------------- #
+dataset:
+  size: 224
+  center_crop: true
+  object_name: "${new_object}"
+  super_class: "${super_class}"
+  dataset_name: "${dataset_name}"
+  class_id: "${new_class}"
+# ---------------------------------------------------------------- #
+dataloader:
+  valid:
+    batch_size: ${batch_size}  # per-GPU
+    num_workers: 4  # per-process
+
+# ---------------------------------------------------------------- #
+trainer:
+  fp16: true
+  print_interval_iters: 100
+  valid_interval_epochs: 1
+  batch_size: ${batch_size}

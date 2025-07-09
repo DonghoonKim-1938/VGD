@@ -1,7 +1,11 @@
+import csv
 import json
 import os
+import time
 from pprint import pprint
 import random
+
+import numpy as np
 import torch
 import open_clip
 from typing import Dict
@@ -9,7 +13,8 @@ from typing import Dict
 from PIL import Image
 from diffusers import StableDiffusionPipeline
 from torch import nn
-from transformers import CLIPModel, AutoModelForCausalLM, AutoTokenizer, CLIPTokenizer
+from transformers import CLIPModel, AutoModelForCausalLM, AutoTokenizer, CLIPTokenizer, LlavaForConditionalGeneration, \
+    AutoProcessor, Blip2ForConditionalGeneration
 from transformers import CLIPImageProcessor, CLIPProcessor
 from statistics import mean
 from sentence_transformers.util import (semantic_search,
@@ -17,8 +22,10 @@ from sentence_transformers.util import (semantic_search,
                                         normalize_embeddings)
 from bluestar.utils.chat_template import PromptTemplate as PT
 from bluestar.utils.random_utils import set_seed
+import os
 
-class VGD(nn.Module):
+
+class VGD_llava(nn.Module):
 
     def __init__(self, cfg: Dict) -> None :
 
@@ -38,7 +45,7 @@ class VGD(nn.Module):
         self.clip_image_transform = CLIPImageProcessor.from_pretrained(self.clip_version)
         if self.get_similarity:
             self.model_ref, _, self.preprocess_ref = open_clip.create_model_and_transforms(cfg["model"]["clip_ref"],
-                                                                                       pretrained=cfg["model"]["clip_ref_pretrain"])
+                                                                        pretrained=cfg["model"]["clip_ref_pretrain"])
         else:
             self.model_ref = None
             self.preprocess_ref = None
@@ -47,26 +54,31 @@ class VGD(nn.Module):
         if self.prompt_distillation:
             self.tokenizer_ref = open_clip.get_tokenizer(cfg["model"]["clip_ref"])
 
-        self.llm = AutoModelForCausalLM.from_pretrained(model_ckpt, load_in_8bit=cfg["model"]["load_in_8bit"])
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(model_ckpt, use_fast=False)
-        self.user_prompt = cfg["model"]["user_prompt"]
-        self.system_prompt = cfg["model"]["system_prompt"]
-        self.model_prompt = cfg["model"]["model_prompt"]
+        self.model_type = cfg["model"]["type"] if cfg["model"].keys() else "LLaVA"
+        if self.model_type == "LLaVA":
+            self.llava = LlavaForConditionalGeneration.from_pretrained(model_ckpt, load_in_8bit=cfg["model"]["load_in_8bit"])
+        elif self.model_type == "BLIP-2":
+            self.llava = Blip2ForConditionalGeneration.from_pretrained(model_ckpt, load_in_8bit=cfg["model"]["load_in_8bit"])
+        self.llava_tokenizer = AutoTokenizer.from_pretrained(model_ckpt, use_fast=False)
+        self.processor = AutoProcessor.from_pretrained(model_ckpt)
+        self.prompt = cfg["model"]["prompt"]
         self.get_initial_condition = cfg["model"]["get_initial_condition"]
+        self.use_caption_as_initial_condition = cfg["model"]["use_caption_as_initial_condition"] \
+            if "use_caption_as_initial_condition" in cfg["model"].keys() else None
 
-        self.llm_alpha = cfg["model"]["llm_alpha"] if "llm_alpha" in cfg["model"].keys() else 1.0
+        self.llava_alpha = cfg["model"]["llm_alpha"] if "llm_alpha" in cfg["model"].keys() else 1.0
         self.clip_alpha = cfg["model"]["clip_alpha"] if "clip_alpha" in cfg["model"].keys() else 1.5
 
         self.beam_expand_factor = cfg["model"]["beam_expand_factor"]
         self.clip_beam_size = cfg["model"]["num_beams"]
-        self.llm_beam_size = self.clip_beam_size * self.beam_expand_factor
+        self.llava_beam_size = self.clip_beam_size * self.beam_expand_factor
 
         self.beam_offset = torch.arange(
             0,
             1 * self.clip_beam_size,
             step=self.clip_beam_size,
             dtype=torch.long,
-            device=self.llm.device,
+            device=self.llava.device,
         )
 
         self.length_cutoff = cfg["length_cutoff"] if cfg.get('length_cutoff') else False
@@ -93,7 +105,6 @@ class VGD(nn.Module):
             self.sd_pipeline = StableDiffusionPipeline.from_pretrained(self.sd_version) #, torch_dtype=torch.float32)
 
         self.data_dir = cfg["data_dir"] if cfg.get("data_dir") else None
-        self.seed = cfg["seed"]
         self.target_images = [Image.open(image_path) for image_path in self.data_dir] if self.data_dir is not None else None
         self.get_feature()
         self.get_llm_initial_condition()
@@ -101,54 +112,13 @@ class VGD(nn.Module):
 
     def get_llm_initial_condition(self):
         if hasattr(self,"all_target_features"):
-
-            self.clip.to("cuda")
-            vocab = list(self.clip_tokenizer.get_vocab())
-            target_features = self.all_target_features
-
-            if self.get_initial_condition and not self.prompt_distillation:
-                best_id = -1
-                best_logits = 0
-
-                target_features = self.all_target_features
-                for i in range(50):
-                    with torch.no_grad():
-                        inputs = self.clip_tokenizer(vocab[i * 1000:(i + 1) * 1000], padding=True,
-                                                     return_tensors="pt").to("cuda")
-                        text_features = self.clip.get_text_features(**inputs).to("cuda")
-                        image_features = target_features.to("cuda") / target_features.norm(dim=1, keepdim=True).to("cuda")
-                        text_features = text_features / text_features.norm(dim=1, keepdim=True).to("cuda")
-                        logits_per_image = image_features.to("cuda") @ text_features.t().to("cuda")
-                        id = torch.argmax(logits_per_image.mean(axis=0))
-                        if best_logits < logits_per_image[0][id]:
-                            best_id = id + i * 1000
-                            best_logits = logits_per_image[0][id]
-                        del text_features
-                        del inputs
-
-                self.initial_condition = f"{vocab[best_id].split('<',1)[0]}"
-
-                self.user_prompt += self.initial_condition
-
-            else:
-                self.initial_condition = None
-
-            self.prompt_template = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": self.user_prompt},
-                {"role": "assistant", "content": self.model_prompt},
-            ]
-            self.llm_prompt = self.llm_tokenizer.apply_chat_template(
-                self.prompt_template, return_tensors="pt"
-            )[:,:-1]
+            self.inputs = self.processor(text=self.prompt, images=self.target_images, return_tensors="pt")
 
     def get_feature(self, ):
         if not self.prompt_distillation:
             with torch.no_grad():
                 curr_images = [torch.tensor(self.clip_image_transform(i)['pixel_values']) for i in self.target_images]
                 curr_images = torch.concatenate(curr_images)
-                # all_target_features = self.clip.get_image_features(pixel_values=curr_images)
-                # all_target_features = all_target_features / all_target_features.norm(p=2, dim=-1, keepdim=True)
                 vision_outputs = self.clip.vision_model(pixel_values=curr_images)
                 pooled_output = vision_outputs['pooler_output']
                 f_img = self.clip.visual_projection(pooled_output)
@@ -160,26 +130,29 @@ class VGD(nn.Module):
                 f_txt = f_txt / f_txt.norm(p=2, dim=-1, keepdim=True)
             self.register_buffer("all_target_features", f_txt)
 
-
     def reset(self):
         self.candidate = [[]]
-        self.candidate_score = [[]] # torch.zeros(self.batch_size, self.clip_beam_size, device=self.llm.device)
-        self.done_cnt = 0  # torch.zeros(self.batch_size, self.clip_beam_size, device=self.llm.device)
+        self.candidate_score = [[]]
+        self.done_cnt = 0
     def eval(self):
         super().eval()
         if not self.gen_prompt_only:
+            self.sd_pipeline.to(self.llava.device)
+        else:
             self.sd_pipeline.to("cuda")
     def train(self, mode: bool = True):
         super().train(mode=mode)
         if not self.gen_prompt_only:
+            self.sd_pipeline.to(self.llava.device)
+        else:
             self.sd_pipeline.to("cuda")
         self.freeze()
 
     def freeze(self):
         if self.freeze_model:
-            self.llm.eval()
-            self.llm.requires_grad_(False)
-            for param in self.llm.parameters():
+            self.llava.eval()
+            self.llava.requires_grad_(False)
+            for param in self.lllava.parameters():
                 param.requires_grad_(False)
 
     @torch.no_grad()
@@ -193,17 +166,14 @@ class VGD(nn.Module):
             object: str=None
     ) -> Dict:
 
-
         generate_output = self.generate_prompt(
-            pixel_values,
-        )
+                pixel_values,
+            )
 
         results = []
-
         if style_transfer:
             generated_prompt = generate_output['text'][0]
             prompt = f"{object} in the style of {generated_prompt}"
-
             if self.gen_prompt_only:
                 images = None
             else:
@@ -215,12 +185,11 @@ class VGD(nn.Module):
             else:
                 similarity = None
 
-            results.append({"image": images, "initial_condition": self.initial_condition, "prompt": prompt,
+            results.append({"image": images, "initial_condition": self.initial_condition, "prompt": generate_output["text"],
                 "input_prompt": generate_output["input_prompt"], "similarity": similarity, "object": object, "seed": self.seed})
         else:
             generated_prompt = generate_output['text'][0]
-            input_prompt = generate_output['input_prompt'][0]
-
+            input_prompt = generate_output['input_prompt']
             if self.gen_prompt_only:
                 images = None
             else:
@@ -232,7 +201,7 @@ class VGD(nn.Module):
             else:
                 similarity = None
 
-            results.append({"image": images, "initial_condition": self.initial_condition, "prompt": [generated_prompt],
+            results.append({"image": images, "initial_condition": None, "prompt": [generated_prompt],
                 "input_prompt": input_prompt, "similarity": similarity, "seed": self.seed})
 
         return results
@@ -249,9 +218,9 @@ class VGD(nn.Module):
 
     def eos_check(self, indices:torch.Tensor, scores:torch.Tensor):
         mask = torch.eq(
-            indices[:,-1],
-            self.llm_tokenizer.eos_token_id
-        )
+                indices[:, -1],
+                self.llava_tokenizer.eos_token_id
+            )
         mask += torch.eq(
             indices[:, -1],
             13
@@ -275,26 +244,28 @@ class VGD(nn.Module):
 
     @torch.no_grad()
     def generate_prompt(self, image: torch.Tensor=None) -> Dict:
-        input_ids = self.llm_prompt.to(self.llm.device)
+        input_ids = self.inputs.to(self.llava.device)
 
-        llm_input_len = input_ids.shape[-1]
-        llm_vocab_size = self.llm.vocab_size
-        cummulative_scores = torch.zeros(1, device=self.llm.device)
+        llm_input_len = input_ids['input_ids'].shape[-1]
+        if self.model_type == 'BLIP-2':
+            llm_vocab_size = self.llava.config.text_config.vocab_size
+        else:
+            llm_vocab_size = self.llava.vocab_size
+        cummulative_scores = torch.zeros(1, device=self.llava.device)
 
         for curr_len in range(1, self.max_length+1):
             # llm decoding step
-            llm_outputs = self.llm(
-                input_ids,
-                use_cache=False,
+            llm_outputs = self.llava(
+                **input_ids,
                 return_dict=True
             )
 
             llm_scores = nn.functional.log_softmax(llm_outputs.logits[:,-1,:], dim=-1)
-            llm_scores += cummulative_scores.view(input_ids.shape[0],-1) #P(x_{0:i})
+            llm_scores += cummulative_scores.view(input_ids['input_ids'].shape[0],-1) #P(x_{0:i})
 
             # Batch x Sequence x Vocab Size
             # llm_topk = torch.topk(llm_scores.view(self.batch_size,-1), dim=-1, k=self.llm_beam_size)
-            llm_topk = torch.topk(llm_scores.view(1,-1), dim=-1, k=self.llm_beam_size)
+            llm_topk = torch.topk(llm_scores.view(1,-1), dim=-1, k=self.llava_beam_size)
             llm_topk_indices = llm_topk.indices % llm_vocab_size
             cummulative_scores = llm_topk.values
             llm_topk_beam_id = llm_topk.indices // llm_vocab_size
@@ -302,21 +273,21 @@ class VGD(nn.Module):
 
 
             # if input_ids.shape[0] == self.batch_size: # in the first generation step.
-            if input_ids.shape[0] == 1: # in the first generation step.
+            if input_ids['input_ids'].shape[0] == 1: # in the first generation step.
                 # input_ids = input_ids.unsqueeze(1).expand(-1,self.clip_beam_size,-1).reshape(self.batch_size*self.clip_beam_size, -1)
-                input_ids = input_ids.unsqueeze(1).expand(-1,self.clip_beam_size,-1).reshape(self.clip_beam_size, -1)
+                input_ids['input_ids'] = input_ids['input_ids'].unsqueeze(1).expand(-1,self.clip_beam_size,-1).reshape(self.clip_beam_size, -1)
 
             # llm_beam_ids = torch.cat(
             #     (input_ids[llm_topk_batch_id].view(self.batch_size, self.llm_beam_size, -1),llm_topk_indices.unsqueeze(-1)),
             #     dim=-1
             # ) # batch x clip_beam x llm_beam x sequence
             llm_beam_ids = torch.cat(
-                (input_ids[llm_topk_batch_id].view(1, self.llm_beam_size, -1),llm_topk_indices.unsqueeze(-1)),
+                (input_ids['input_ids'][llm_topk_batch_id].view(1, self.llava_beam_size, -1),llm_topk_indices.unsqueeze(-1)),
                 dim=-1
             ) # batch x clip_beam x llm_beam x sequence
             llm_beam_ids = llm_beam_ids.view(-1, llm_beam_ids.shape[-1])
 
-            llm_gen_text = self.llm_tokenizer.batch_decode(
+            llm_gen_text = self.llava_tokenizer.batch_decode(
                 llm_beam_ids[:,llm_input_len:],
                 skip_special_tokens=True
             )
@@ -326,8 +297,8 @@ class VGD(nn.Module):
             if hasattr(self, "all_target_features"):
 
                 clip_text_embed = self.clip.get_text_features(
-                    input_ids=torch.tensor(clip_input_ids['input_ids']).to(self.llm.device),
-                    attention_mask=torch.tensor(clip_input_ids['attention_mask']).to(self.llm.device),
+                    input_ids=torch.tensor(clip_input_ids['input_ids']).to(self.llava.device),
+                    attention_mask=torch.tensor(clip_input_ids['attention_mask']).to(self.llava.device),
                 )
                 clip_text_embed = clip_text_embed / clip_text_embed.norm(p=2, dim=-1, keepdim=True)
                 clip_logits_scale = self.clip.logit_scale.exp()
@@ -338,20 +309,20 @@ class VGD(nn.Module):
                 clip_logits = torch.matmul(target_features, clip_text_embed.t()) * clip_logits_scale
                 # P(x_{0:i}|I)
                 clip_scores = clip_logits.reshape(target_features.shape[0], -1,
-                                                  self.llm_beam_size).log_softmax(dim=-1)
+                                                  self.llava_beam_size).log_softmax(dim=-1)
 
             else:
                 clip_output = self.clip(
-                    input_ids=torch.tensor(clip_input_ids['input_ids']).to(self.llm.device),
+                    input_ids=torch.tensor(clip_input_ids['input_ids']).to(self.llava.device),
                     pixel_values=image,
-                    attention_mask=torch.tensor(clip_input_ids['attention_mask']).to(self.llm.device),
+                    attention_mask=torch.tensor(clip_input_ids['attention_mask']).to(self.llava.device),
                 )
                 clip_logits = clip_output.logits_per_image
                 clip_scores = clip_logits.reshape(image.shape[0], -1,
-                                                  self.llm_beam_size).log_softmax(dim=-1)
+                                                  self.llava_beam_size).log_softmax(dim=-1)
 
 
-            total_score = self.llm_alpha * cummulative_scores + self.clip_alpha * clip_scores.mean(0)
+            total_score = self.llava_alpha * cummulative_scores + self.clip_alpha * clip_scores.mean(0)
             if self.length_cutoff:
                 clip_input_length = torch.tensor(clip_input_ids['attention_mask']).sum(-1)
 
@@ -365,26 +336,35 @@ class VGD(nn.Module):
                     + self.beam_expand_factor * self.beam_offset.unsqueeze(-1)
             ).view(-1)
             # cummulative_scores = cummulative_scores.reshape(self.batch_size * self.llm_beam_size,-1)
-            cummulative_scores = cummulative_scores.reshape(1 * self.llm_beam_size,-1)
+            cummulative_scores = cummulative_scores.reshape(1 * self.llava_beam_size,-1)
             # cummulative_scores = cummulative_scores[beam_index].reshape(self.batch_size * self.clip_beam_size,-1)
             cummulative_scores = cummulative_scores[beam_index].reshape(1 * self.clip_beam_size,-1)
             # input_ids = llm_beam_ids[beam_index].reshape(self.batch_size * self.clip_beam_size,-1)
-            input_ids = llm_beam_ids[beam_index].reshape(1 * self.clip_beam_size,-1)
+            input_ids['input_ids'] = llm_beam_ids[beam_index].reshape(1 * self.clip_beam_size,-1)
+
+            if input_ids['input_ids'].shape != input_ids['attention_mask'].shape:
+                input_ids['attention_mask'] = torch.tensor(np.full((input_ids['input_ids'].shape), 1))
+
+            if input_ids['input_ids'].shape[0] != input_ids['pixel_values'].shape[0]:
+                input_ids['pixel_values'] = torch.cat([input_ids['pixel_values']]*input_ids['input_ids'].shape[0], dim=0)
 
             # output_ids = input_ids.reshape(self.batch_size * self.clip_beam_size, -1)[0:10, llm_input_len:]
-            output_ids = input_ids.reshape(1 * self.clip_beam_size, -1)[0:10, llm_input_len:]
-            output_text = self.llm_tokenizer.batch_decode(
+            output_ids = input_ids['input_ids'].reshape(1 * self.clip_beam_size, -1)[0:10, llm_input_len:]
+            output_text = self.llava_tokenizer.batch_decode(
                 output_ids,
                 skip_special_tokens=True
             )
 
             pprint(output_text)
+
+
             if self.is_done():
                 break
 
+        # f.close()
         output_score = total_score[:, 0]
         # output_ids = input_ids.reshape(self.batch_size, self.clip_beam_size, -1)[:, 0, llm_input_len:]
-        output_ids = input_ids.reshape(1, self.clip_beam_size, -1)[:, 0, llm_input_len:]
+        output_ids = input_ids['input_ids'].reshape(1, self.clip_beam_size, -1)[:, 0, llm_input_len:]
 
         # put the best-last decoded text into the candidate and pick the best
         # for b_i in range(self.batch_size):
@@ -400,32 +380,33 @@ class VGD(nn.Module):
             b_i_best = self.candidate_score[b_i].index(max(self.candidate_score[b_i]))
             self.candidate[b_i] = self.candidate[b_i][b_i_best]
 
-        output_text = self.llm_tokenizer.batch_decode(
+        output_text = self.llava_tokenizer.batch_decode(
             self.candidate,
             skip_special_tokens=True
         )
+
         # output_text[0] = "A photo of " + output_text[0]
         pprint(output_text)
 
-        input_prompt = self.llm_tokenizer.batch_decode(
-            input_ids,
+
+        input_prompt = self.llava_tokenizer.batch_decode(
+            input_ids['input_ids'],
             skip_special_tokens=False
         )
 
         return {"text":output_text, "input_prompt": input_prompt}
 
-
     def measure_similarity(self, output):
         with (torch.no_grad()):
             ori_batch = [self.preprocess_ref(i).unsqueeze(0) for i in self.target_images]
             if not self.clip:
-                ori_batch = torch.concatenate(ori_batch).to(self.llm.device)
+                ori_batch = torch.concatenate(ori_batch).to(self.llava.device)
             else:
                 ori_batch = torch.concatenate(ori_batch).to("cuda")
 
             gen_batch = [self.preprocess_ref(i).unsqueeze(0) for i in output]
             if not self.clip:
-                gen_batch = torch.concatenate(gen_batch).to(self.llm.device)
+                gen_batch = torch.concatenate(gen_batch).to(self.llava.device)
             else:
                 gen_batch = torch.concatenate(gen_batch).to("cuda")
 
