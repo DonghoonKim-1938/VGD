@@ -9,7 +9,7 @@ import torch
 
 import sys
 
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from bluestar.utils.save_utils import save_predict
 from bluestar.utils.config_utils import prepare_config
 from bluestar.utils.wandb_utils import set_wandb
